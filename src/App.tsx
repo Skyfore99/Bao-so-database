@@ -385,6 +385,11 @@ export default function App() {
       return showToast("Lỗi: Tổng luỹ kế nhỏ hơn đã báo!", "error");
     }
 
+    const target = Number(selectedItem.kh) || 0;
+    if (target > 0 && newCumulative > target) {
+      return showToast(`Lỗi: Vượt quá kế hoạch (${target})`, "error");
+    }
+
     const inputQty = fixDecimal(newCumulative - currentCumulative);
     setIsSubmitting(true);
 
