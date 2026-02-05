@@ -118,11 +118,6 @@ export default function App() {
   const [lastSync, setLastSync] = useState(null);
   const [showAllInput, setShowAllInput] = useState(false);
 
-  const [cacheStatus, setCacheStatus] = useState({
-    hasCache: false,
-    cacheTime: null,
-  });
-
   const [filters, setFilters] = useState({
     ma: "",
     mau: "",
@@ -143,7 +138,7 @@ export default function App() {
   const [reportData, setReportData] = useState([]);
   const [reportFilterMa, setReportFilterMa] = useState("");
   const [reportFilterGroup, setReportFilterGroup] = useState("");
-  const [reportCache, setReportCache] = useState({});
+  const [reportFilterPO, setReportFilterPO] = useState("");
 
   const [toast, setToast] = useState({ show: false, msg: "", type: "info" });
   const qtyInputRef = useRef(null);
@@ -189,7 +184,13 @@ export default function App() {
       setShowConfig(true);
     }
 
-    checkCacheStatus();
+    if (savedUrl && savedKey) {
+      setSupabaseUrl(savedUrl);
+      setSupabaseKey(savedKey);
+      loadConfig(savedUrl, savedKey, false);
+    } else {
+      setShowConfig(true);
+    }
   }, []);
 
   useEffect(() => {
@@ -256,31 +257,6 @@ export default function App() {
       ? "0.00"
       : parseFloat(num).toFixed(2);
 
-  const checkCacheStatus = () => {
-    try {
-      const cached = localStorage.getItem(CACHE_KEYS.ITEMS);
-      const cacheTime = localStorage.getItem(CACHE_KEYS.TIME);
-      if (cached && cacheTime) {
-        setCacheStatus({
-          hasCache: true,
-          cacheTime: new Date(parseInt(cacheTime)),
-        });
-      } else {
-        setCacheStatus({ hasCache: false, cacheTime: null });
-      }
-    } catch (e) {
-      setCacheStatus({ hasCache: false, cacheTime: null });
-    }
-  };
-
-  const clearCache = () => {
-    localStorage.removeItem(CACHE_KEYS.ITEMS);
-    localStorage.removeItem(CACHE_KEYS.TIME);
-    setCacheStatus({ hasCache: false, cacheTime: null });
-    showToast("Đã xóa cache", "success");
-    if (supabaseUrl && supabaseKey) loadConfig(supabaseUrl, supabaseKey, false);
-  };
-
   const saveConfig = () => {
     if (!supabaseUrl.trim() || !supabaseKey.trim())
       return showToast("Vui lòng nhập URL và Key", "error");
@@ -294,32 +270,40 @@ export default function App() {
   const loadConfig = async (url, key, silent = false) => {
     if (!url || !key) return;
 
-    // Step 1: Cache
-    if (!silent) {
-      const cached = localStorage.getItem(CACHE_KEYS.ITEMS);
-      const cacheTime = localStorage.getItem(CACHE_KEYS.TIME);
-      if (cached) {
-        setMasterItems(JSON.parse(cached));
-        setConnectionStatus("connected");
-        if (cacheTime) setLastSync(new Date(parseInt(cacheTime)));
-      }
-    }
-
-    // Step 2: Network
+    // Step 1: Network Load Only
     if (!silent) {
       setIsConfigLoading(true);
       setSyncStatus("syncing");
     }
 
+    // Step 2: Network
+
     try {
       const supabase = getSupabase(url, key);
       if (!supabase) throw new Error("Supabase Init Failed");
 
-      const { data, error } = await supabase
-        .from("view_config_summary")
-        .select("*");
+      let allConfig = [];
+      let from = 0;
+      const step = 1000;
+      let more = true;
 
-      if (error) throw error;
+      while (more) {
+        const { data, error } = await supabase
+          .from("config")
+          .select("*")
+          .range(from, from + step - 1);
+
+        if (error) throw error;
+        if (data && data.length > 0) {
+          allConfig = [...allConfig, ...data];
+          from += step;
+          if (data.length < step) more = false;
+        } else {
+          more = false;
+        }
+      }
+
+      const data = allConfig;
 
       if (data) {
         // Map DB columns to App structure
@@ -328,11 +312,11 @@ export default function App() {
           style: item.style,
           mau: item.mau,
           don: item.don,
-          po: item.po,
+          po: String(item.po || ""),
           shipdate: item.shipdate || "",
           kh: Number(item.kh) || 0,
           nhom: item.nhom || "",
-          current: Number(item.current) || 0,
+          current: Number(item.luy_ke) || 0,
           xuatDu: item.xuat_du === "x" ? "x" : "",
           // Keep ID for updates
           id: item.id,
@@ -341,17 +325,14 @@ export default function App() {
         setMasterItems(mappedItems);
 
         if (!silent) {
-          localStorage.setItem(CACHE_KEYS.ITEMS, JSON.stringify(mappedItems));
-          localStorage.setItem(CACHE_KEYS.TIME, Date.now().toString());
-          checkCacheStatus();
-        }
-
-        if (!silent) {
           setSyncStatus("complete");
           setTimeout(() => setSyncStatus("idle"), 3000);
         }
         setConnectionStatus("connected");
         setLastSync(new Date());
+
+        // Auto load report as requested
+        fetchReport(true);
       }
     } catch (e) {
       if (!silent) {
@@ -463,15 +444,7 @@ export default function App() {
   const fetchReport = async (forceRefresh = false) => {
     if (!supabaseUrl || !supabaseKey) return;
 
-    if (!forceRefresh && reportCache[reportDate]) {
-      setReportData(reportCache[reportDate]);
-      setReportFilterMa("");
-      return;
-    }
-
     setLoadingReport(true);
-    setReportFilterMa("");
-    setReportFilterGroup("");
 
     try {
       const supabase = getSupabase(supabaseUrl, supabaseKey);
@@ -482,22 +455,33 @@ export default function App() {
       const endOfDay = new Date(reportDate);
       endOfDay.setHours(23, 59, 59, 999);
 
-      const { data: logs, error } = await supabase
-        .from("logs")
-        .select("*")
-        .gte("created_at", startOfDay.toISOString())
-        .lte("created_at", endOfDay.toISOString());
+      let allLogs = [];
+      let fromLog = 0;
+      const stepLog = 1000;
+      let moreLog = true;
 
-      if (error) throw error;
+      while (moreLog) {
+        const { data: chunk, error } = await supabase
+          .from("logs")
+          .select("*")
+          .gte("created_at", startOfDay.toISOString())
+          .lte("created_at", endOfDay.toISOString())
+          .range(fromLog, fromLog + stepLog - 1);
 
-      // 2. Fetch All Current Totals (for items involved)
-      // To be efficient, we might want to just load all config again
-      // Or just rely on masterItems?
-      // Better to fetch fresh view_config_summary to be accurate
-      const { data: configData, error: configError } = await supabase
-        .from("view_config_summary")
-        .select("*");
-      if (configError) throw configError;
+        if (error) throw error;
+        if (chunk && chunk.length > 0) {
+          allLogs = [...allLogs, ...chunk];
+          fromLog += stepLog;
+          if (chunk.length < stepLog) moreLog = false;
+        } else {
+          moreLog = false;
+        }
+      }
+      const logs = allLogs;
+
+      // 2. Fetch All Current Totals - OPTIMIZATION: Use masterItems locally (already full loaded)
+      // No need to fetch config again
+      const configData = masterItems;
 
       // 3. Process Data
       const dailyMap = {}; // Key -> NK Sum
@@ -516,7 +500,8 @@ export default function App() {
         if (seenKeys.has(key)) return;
         seenKeys.add(key);
 
-        // Find updated total from configData
+        // Find updated total from configData (masterItems)
+        // Note: masterItems uses 'current' for luy_ke
         const configItem = configData.find(
           (c) =>
             c.po === log.po &&
@@ -526,7 +511,7 @@ export default function App() {
             c.don === log.don
         );
 
-        const currentTotal = configItem ? Number(configItem.current) : 0;
+        const currentTotal = configItem ? Number(configItem.current) || 0 : 0;
 
         // Original report structure
         results.push({
@@ -544,10 +529,9 @@ export default function App() {
 
       console.log("Report Data:", results);
       setReportData(results);
-      setReportCache((p) => ({ ...p, [reportDate]: results }));
     } catch (e) {
       console.error(e);
-      showToast("Lỗi tải báo cáo", "error");
+      showToast("Lỗi tải báo cáo: " + e.message, "error");
     } finally {
       setLoadingReport(false);
     }
@@ -558,7 +542,8 @@ export default function App() {
       reportData
         .filter(
           (item) =>
-            !reportFilterGroup || String(item.nhom) === reportFilterGroup
+            (!reportFilterGroup || String(item.nhom) === reportFilterGroup) &&
+            (!reportFilterPO || String(item.po) === reportFilterPO)
         )
         .map((item) => String(item.ma || ""))
         .filter(Boolean)
@@ -567,17 +552,34 @@ export default function App() {
   const availableReportGroups = [
     ...new Set(
       reportData
-        .filter((item) => !reportFilterMa || String(item.ma) === reportFilterMa)
+        .filter(
+          (item) =>
+            (!reportFilterMa || String(item.ma) === reportFilterMa) &&
+            (!reportFilterPO || String(item.po) === reportFilterPO)
+        )
         .map((item) => String(item.nhom || ""))
         .filter(Boolean)
     ),
   ].sort((a, b) => a.localeCompare(b));
+  const availableReportPOs = [
+    ...new Set(
+      reportData
+        .filter(
+          (item) =>
+            (!reportFilterMa || String(item.ma) === reportFilterMa) &&
+            (!reportFilterGroup || String(item.nhom) === reportFilterGroup)
+        )
+        .map((item) => String(item.po || ""))
+        .filter(Boolean)
+    ),
+  ].sort();
 
   const displayedReportData = reportData.filter((item) => {
     const matchMa = !reportFilterMa || String(item.ma) === reportFilterMa;
     const matchGroup =
       !reportFilterGroup || String(item.nhom) === reportFilterGroup;
-    return matchMa && matchGroup;
+    const matchPO = !reportFilterPO || String(item.po) === reportFilterPO;
+    return matchMa && matchGroup && matchPO;
   });
 
   const selectGroup = (g) => {
@@ -720,25 +722,15 @@ export default function App() {
             </button>
           </div>
 
-          {cacheStatus.hasCache && (
-            <div className="mt-3 p-2 bg-blue-50 border border-blue-100 rounded-lg flex items-center justify-between">
-              <div className="flex items-center gap-2 text-xs text-blue-700">
-                <Database size={14} />
-                <span>
-                  Cache: {cacheStatus.cacheTime?.toLocaleTimeString()}{" "}
-                  <span className="text-blue-500 ml-1">
-                    ({masterItems.length} items)
-                  </span>
-                </span>
-              </div>
-              <button
-                onClick={clearCache}
-                className="text-xs text-red-600 hover:text-red-700 font-medium flex items-center gap-1"
-              >
-                <Trash2 size={12} /> Xóa
-              </button>
+          <div className="mt-3 p-2 bg-blue-50 border border-blue-100 rounded-lg flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs text-blue-700">
+              <Database size={14} />
+              <span>
+                Items Loaded (v1.2):{" "}
+                <span className="font-bold">{masterItems.length}</span>
+              </span>
             </div>
-          )}
+          </div>
         </div>
 
         {/* TABS */}
@@ -1073,34 +1065,22 @@ export default function App() {
           {activeTab === "report" && (
             <div className="h-full flex flex-col bg-slate-50">
               <div className="p-3 bg-white border-b border-slate-200 shrink-0 space-y-2 shadow-sm">
-                <div className="flex gap-2">
+                <div className="grid grid-cols-1 gap-2">
                   <input
                     type="date"
                     value={reportDate}
                     onChange={(e) => setReportDate(e.target.value)}
-                    className="flex-1 p-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-medium focus:outline-none focus:border-blue-500"
+                    className="w-full p-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-medium focus:outline-none focus:border-blue-500"
                   />
-                  <button
-                    onClick={() => fetchReport(true)}
-                    disabled={loadingReport}
-                    className="px-3 bg-blue-600 text-white rounded-lg text-sm font-bold shadow-md active:scale-95 transition flex items-center gap-1 justify-center disabled:opacity-50"
-                    title="Làm mới dữ liệu"
-                  >
-                    {loadingReport ? (
-                      <Loader2 size={16} className="animate-spin" />
-                    ) : (
-                      <RefreshCw size={16} />
-                    )}
-                  </button>
                 </div>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-3 gap-2">
                   <div className="relative">
                     <select
                       value={reportFilterMa}
                       onChange={(e) => setReportFilterMa(e.target.value)}
                       className="w-full p-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-medium focus:outline-none focus:border-blue-500 appearance-none truncate"
                     >
-                      <option value="">Tất cả Mã Hàng</option>
+                      <option value="">Mã Hàng</option>
                       {availableReportMas
                         .sort((a, b) =>
                           !isNaN(Number(a)) && !isNaN(Number(b))
@@ -1123,10 +1103,27 @@ export default function App() {
                       onChange={(e) => setReportFilterGroup(e.target.value)}
                       className="w-full p-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-medium focus:outline-none focus:border-blue-500 appearance-none truncate"
                     >
-                      <option value="">Tất cả Nhóm</option>
+                      <option value="">Nhóm</option>
                       {availableReportGroups.map((g, idx) => (
                         <option key={idx} value={g}>
                           {g}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none text-slate-500">
+                      <ChevronDown size={14} />
+                    </div>
+                  </div>
+                  <div className="relative">
+                    <select
+                      value={reportFilterPO}
+                      onChange={(e) => setReportFilterPO(e.target.value)}
+                      className="w-full p-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-medium focus:outline-none focus:border-blue-500 appearance-none truncate"
+                    >
+                      <option value="">PO</option>
+                      {availableReportPOs.map((p, idx) => (
+                        <option key={idx} value={p}>
+                          {p}
                         </option>
                       ))}
                     </select>
